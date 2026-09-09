@@ -152,12 +152,15 @@ def contents(repo, path, ref):
 
 
 def publish(value):
+    # 1. Validate the proposal and expected repository/workflow context.
     value = validate_candidate(value)
     package, previous, selected = value["package"], value["previous"], value["selected"]
     repo = os.environ["GITHUB_REPOSITORY"]
     require(repo == "engimatic-systems/nix-engimatic-pkgs", "unexpected destination repository")
     require(os.environ.get("GITHUB_EVENT_NAME") in {"schedule", "workflow_dispatch"},
             "publisher only runs from scheduled or manual workflows")
+
+    # 2. Leave any open update PR for this package untouched.
     prefix = f"automation/update-{package}-"
     pages = api(f"repos/{repo}/pulls?state=open&per_page=100", paginate=True)
     if any(pull["head"]["ref"].startswith(prefix)
@@ -166,6 +169,7 @@ def publish(value):
         print(f"{package}: existing update PR left untouched")
         return
 
+    # 3. Confirm the base commit and previous pin still match discovery.
     base = api(f"repos/{repo}")["default_branch"]
     base_ref = api(f"repos/{repo}/git/ref/heads/{base}")
     base_sha = base_ref["object"]["sha"]
@@ -175,13 +179,18 @@ def publish(value):
     file_data, base_pin = contents(repo, path, base_sha)
     require(base_pin == previous, "base selection changed; rediscover the release")
 
-    branch = prefix + selected["version"]
+    # 4. Create a fresh versioned branch from the checked base commit.
     # Creation fails if this branch exists. Never reuse or overwrite a proposal.
+    branch = prefix + selected["version"]
     api(f"repos/{repo}/git/refs", "POST", {"ref": f"refs/heads/{branch}", "sha": base_sha})
+
+    # 5. Commit only the selected version/hash metadata on that branch.
     api(f"repos/{repo}/contents/{path}", "PUT", {
         "message": f"Update {package} to {selected['version']}", "branch": branch,
         "sha": file_data["sha"], "content": base64.b64encode(encode_pin(selected).encode()).decode(),
     })
+
+    # 6. Open the PR with evidence and the human CI approval instructions.
     release_url, asset_url = release_urls(package, selected["version"])
     body = (f"Update {package} from {previous['version']} to {selected['version']}.\n\n"
             f"[Upstream release notes]({release_url}) · [Official archive]({asset_url})\n\n"

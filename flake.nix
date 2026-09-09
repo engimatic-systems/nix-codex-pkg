@@ -1,5 +1,5 @@
 {
-  description = "The official Codex CLI bundle packaged for Nix";
+  description = "Official tool releases packaged for Nix by Engimatic Systems";
 
   inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-26.05";
 
@@ -9,14 +9,15 @@
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
       codex = pkgs.callPackage ./package.nix { };
+      pi = pkgs.callPackage ./pi.nix { };
     in
     {
       packages.${system} = {
-        inherit codex;
+        inherit codex pi;
         default = codex;
       };
 
       # Building the package runs its offline installation checks.
-      checks.${system}.codex = codex;
+      checks.${system} = { inherit codex pi; };
     };
 }

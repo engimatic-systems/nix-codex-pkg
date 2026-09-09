@@ -8,13 +8,16 @@
   jq,
 }:
 
+let
+  release = builtins.fromJSON (builtins.readFile ./releases/codex.json);
+in
 stdenvNoCC.mkDerivation (finalAttrs: {
   pname = "codex";
-  version = "0.153.4";
+  inherit (release) version;
 
   src = fetchurl {
     url = "https://github.com/openai/codex/releases/download/rust-v${finalAttrs.version}/codex-package-x86_64-unknown-linux-musl.tar.gz";
-    hash = "sha256-qCIYfhokIMYcWSZyG/vYeHAe2VVHybsNTeRJiha6GCE=";
+    inherit (release) hash;
   };
 
   sourceRoot = ".";

@@ -1,100 +1,150 @@
-# nix-codex-pkg
+# nix-engimatic-pkgs
 
-The official Codex CLI release bundle, packaged for **x86_64 Linux** with Nix.
-The package includes the CLI, code-mode helper, bundled tools and resources,
-and shell completions. It does not compile Codex from source.
+Official Codex and Pi release bundles packaged for **x86_64 Linux** with Nix.
+This repository was formerly named `nix-codex-pkg`. The `codex` and `default`
+outputs retain their existing meaning; `pi` exposes the Pi coding agent.
 
-## Build and try it
+## Build and try
 
-Requires Nix with `nix-command` and `flakes` enabled. From a checkout:
+Requires Nix with `nix-command` and `flakes` enabled:
 
 ```sh
+nix build .#pi --no-update-lock-file
+./result/bin/pi --version
+nix run .#pi --no-update-lock-file -- --help
 nix build .#codex --no-update-lock-file
-./result/bin/codex --version
-nix run .#codex --no-update-lock-file -- --help
 nix flake check --no-update-lock-file --print-build-logs
 ```
 
-`nix build` creates an immutable package in `/nix/store` and a `result` symlink
-to it. `nix run` executes that package without installing it into your normal
-shell's `PATH`. Neither command switches the NixOS configuration.
+Building adds an immutable package to `/nix/store`; running executes it without
+installing it into your normal `PATH`. Neither operation switches NixOS.
 
-## How the package works
+## Packaging and verification
 
-- `package.nix` is the build recipe, called a **derivation**. It selects the
-  Codex version, downloads an archive with an exact SHA-256, preserves the
-  upstream directory layout, and patches dynamic ELF dependencies for Nix.
-- `flake.nix` exposes that recipe as `packages.x86_64-linux.codex` and
-  `packages.x86_64-linux.default`. Both names refer to the same package.
-- `flake.lock` pins Nixpkgs, which supplies the build tools and runtime
-  libraries. The release hash pins the downloaded archive; the lock file pins
-  the tools used to package it.
+`codex.nix` packages Codex; `pi.nix` packages Pi. `releases/codex.json` and
+`releases/pi.json` select exact versions and archive SHA-256 hashes. Both
+recipes fetch only the designated official upstream release archives.
+`flake.lock` separately pins Nixpkgs and the packaging tools/runtime libraries.
+These packages adapt upstream binaries; they do not compile the agents from
+source or install packages through npm.
 
-The bundle contains static and dynamic executables. In particular, its bundled
-zsh needs Nix's loader and ncurses libraries. `autoPatchelfHook` repairs dynamic
-dependencies; `dontStrip` preserves the upstream static binaries. Installing
-only `bin/codex` would discard its helper and resource layout.
+Codex retains its helpers, bundled tools, resources, and shell completions.
+Its checks verify the CLI version, helper startup, ripgrep, bubblewrap, bundled
+zsh, package metadata, and completions.
 
-Installation checks run without credentials or model requests. They verify the
-CLI version, launch the helper, ripgrep, and bubblewrap, execute a command in
-bundled zsh, and check package metadata and completions. These checks establish
-that the bundled programs start; an authenticated agent task and actual sandbox
-operation still require testing on the intended host.
+Pi preserves the complete standalone release under `libexec/pi`, including
+themes, HTML export assets, image WASM, documentation, examples, and its native
+clipboard addon. The wrapper supplies Bash, ripgrep, and fd and sets
+`PI_PACKAGE_DIR`. ELF dependencies are patched for Nix; stripping is disabled
+to preserve the standalone executable's embedded payload. Checks verify CLI
+startup/version, metadata, required resources, and native addon loading.
 
-## Use it from NixOS
+Pi's version checks and install telemetry default off; updates belong to this
+flake. Users can explicitly override `PI_SKIP_VERSION_CHECK` or `PI_TELEMETRY`.
+`PI_OFFLINE=1` additionally disables startup network operations when desired.
 
-For a NixOS configuration already using flakes, add this input to its existing
-`inputs` attribute set. The repository is private, so fetching it requires
-GitHub access; this example uses SSH authentication.
+Installation checks run offline without credentials or model requests. They
+do not establish authenticated model access, graphical clipboard operation,
+or the suitability of every extension. Authentication, sessions, settings,
+and project tools remain user-local. A fresh Pi session can use `/login`.
+
+## Consume from NixOS
+
+Add an input to your existing flake:
 
 ```nix
-inputs.codex-pkg.url =
-  "git+ssh://git@github.com/engimatic-systems/nix-codex-pkg?ref=main";
+inputs.engimatic-pkgs.url = "github:engimatic-systems/nix-engimatic-pkgs";
 ```
 
-Accept `codex-pkg` in the existing flake's `outputs` function, then add an inline
-module to the selected host's `nixosSystem.modules` list:
+Accept `engimatic-pkgs` in `outputs`, then select packages in a host module:
 
 ```nix
 ({ pkgs, ... }: {
   environment.systemPackages = [
-    codex-pkg.packages.${pkgs.stdenv.hostPlatform.system}.codex
+    engimatic-pkgs.packages.${pkgs.stdenv.hostPlatform.system}.codex
+    engimatic-pkgs.packages.${pkgs.stdenv.hostPlatform.system}.pi
   ];
 })
 ```
 
-This consumes the package built with **this repository's locked Nixpkgs**,
-even if the host uses another Nixpkgs revision. Unsupported architectures have
-no package output. This first milestone provides a package, not a host module.
+Packages use this repository's locked Nixpkgs independently of the host's OS
+selection. Only `x86_64-linux` is currently supported. Existing consumers can
+keep the local input name `codex-pkg` while updating its repository URL.
 
-The consuming flake's lock file records the exact package-repository revision.
-Following `main` in the input URL does not make an existing lock auto-update.
-When intentionally upgrading, run `nix flake update codex-pkg` in that consuming
-repository, review its lock change, and use its normal NixOS deployment path.
+The consumer's lock records an exact package-repository revision. To adopt
+updates, run `nix flake update engimatic-pkgs` in the consuming repository,
+review that lock change, build, and follow the host's normal deployment path.
+A package PR merge alone changes no consumer lock or running host. Check
+`command -v pi` / `pi --version` and the corresponding Codex commands after
+deployment for older npm installs or shims taking precedence.
 
-Existing npm installs, mise shims, or standalone copies can take precedence over
-the system package. Check both `command -v codex` and `codex --version` in the
-intended user's shell after deployment. Authentication, user configuration,
-sessions, and project tools remain outside this package.
+## Update and recover
 
-## How it gets distributed
+The **Propose release updates** workflow runs daily at 09:23 UTC or manually
+from the Actions page on the default branch. GitHub schedules are best-effort;
+a manual run provides the same behavior. It uses the repository's built-in
+`GITHUB_TOKEN`; no separate bot account, personal token, or GitHub App is needed.
 
-This Git repository distributes the **recipe and pinned inputs**. A consumer
-with access fetches the recipe, and Nix either substitutes the resulting store
-path from a configured trusted binary cache or builds it. Here, building means
-downloading and adapting the pinned upstream binary bundle.
+Keep organization/repository token defaults read-only and enable **Allow GitHub
+Actions to create and approve pull requests**. Only the PR-writing job requests
+`contents: write` and `pull-requests: write`. It never approves or merges PRs.
 
-The CI workflow builds and checks the package on Linux. It does **not** publish
-a binary cache. Upstream Nixpkgs dependencies can use the normal NixOS cache;
-do not assume that this custom Codex output is available there. A future cache
-could distribute the package and its runtime dependencies without each host
-repackaging the archive.
+The read-only discovery job queries each official repository's latest stable
+release, checks the expected tag and archive URL, downloads the archive without
+extracting or running it, and compares its SHA-256 against GitHub's release asset
+digest. Missing digests/assets, prereleases, downgrades, digest mismatches, and
+changed bytes for the currently selected release fail for manual investigation.
 
-To change the release today, update `version` and `src.hash` in `package.nix`,
-then run the build and checks above. Verify the archive's SHA-256 against the
-upstream release asset digest before adopting it.
+The separate writer leaves a package alone while it has any open update PR,
+even if a newer upstream release becomes available. It recognizes same-repository
+PR branches named `automation/update-<package>-<version>`; reserve that prefix
+for this workflow. Other packages can still receive proposals.
 
-Automated release updates, publication of passing revisions, and sys deployment
-records are subsequent work. They will let sys select a published package
-without routine pin edits in sys; that deployment mechanism is not implemented
-by this first package PR.
+When no update PR is open, the writer validates the version/hash proposal again
+and creates a fresh versioned branch from the checked default-branch commit.
+It writes only `releases/<package>.json` and opens a PR with upstream links and
+digest evidence. It never refreshes, rebases, or overwrites an existing proposal.
+Neither job builds or executes the proposed binaries, and no candidate code is
+checked out by the writer. Actions are pinned to commits.
+
+**Human approval before CI is intentional.** PRs created with
+`GITHUB_TOKEN` cause the `pull_request` checks to wait for approval. Select
+**Approve workflows to run** on the PR, inspect the offline checks and upstream
+release notes, then separately decide whether to merge. Do not replace the
+token or add workflow dispatch to bypass this gate. See
+[GitHub's workflow-trigger contract](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow#triggering-a-workflow-from-a-workflow).
+A matching hash establishes byte identity, not upstream safety.
+
+For a read-only local check (Python 3.10+ and authenticated `gh`):
+
+```sh
+python3 scripts/update_releases.py check all
+python3 scripts/update_releases.py check pi
+python3 -m unittest discover -s tests -v
+```
+
+This prints proposed metadata and verifies downloads without changing files or
+creating PRs. You can copy a reviewed selection into `releases/<package>.json`
+and run the builds above for a manual update. No-op runs still verify the
+currently selected release digest. Repeating a pending proposal leaves its
+branch, title, body, and CI approval state untouched.
+
+If main moved during discovery, rerun. If publication is interrupted or the
+versioned branch already exists without an open PR, the workflow stops. Inspect
+that branch and either finish the PR manually or delete it after preserving any
+needed work, then rerun. There is no automatic recovery or branch cleanup.
+
+Merge or close the current PR before requesting another proposal for that
+package. A retained branch for an older version does not block a newer release;
+retrying the same version requires deleting its branch first. Closing a PR is
+not a durable release exclusion. Disable the update workflow while investigating
+a release you do not want to adopt.
+
+Restore the previous metadata commit to undo a package selection. Consumers
+must separately restore their prior dependency lock and deploy the previous
+host generation to roll back an installed update.
+
+CI builds and checks the packages but publishes no binary cache. Nixpkgs
+dependencies may come from the normal NixOS cache; custom package outputs are
+built from the pinned official archives on each consumer unless an explicitly
+trusted cache is configured.

@@ -21,7 +21,7 @@ installing it into your normal `PATH`. Neither operation switches NixOS.
 
 ## Packaging and verification
 
-`package.nix` packages Codex; `pi.nix` packages Pi. `releases/codex.json` and
+`codex.nix` packages Codex; `pi.nix` packages Pi. `releases/codex.json` and
 `releases/pi.json` select exact versions and archive SHA-256 hashes. Both
 recipes fetch only the designated official upstream release archives.
 `flake.lock` separately pins Nixpkgs and the packaging tools/runtime libraries.

@@ -8,7 +8,7 @@
     let
       system = "x86_64-linux";
       pkgs = import nixpkgs { inherit system; };
-      codex = pkgs.callPackage ./package.nix { };
+      codex = pkgs.callPackage ./codex.nix { };
       pi = pkgs.callPackage ./pi.nix { };
     in
     {

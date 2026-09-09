@@ -95,16 +95,19 @@ extracting or running it, and compares its SHA-256 against GitHub's release asse
 digest. Missing digests/assets, prereleases, downgrades, digest mismatches, and
 changed bytes for the currently selected release fail for manual investigation.
 
-The separate writer validates the small version/hash proposal again and writes
-only `releases/<package>.json` on `automation/update-<package>`. It opens or
-refreshes one PR per package with upstream links and digest evidence. It
-preserves branch ancestry and constructs the candidate from current main plus
-that one metadata file, including when an earlier update was squash-merged.
-Non-metadata edits on an update branch stop automation for manual review.
+The separate writer leaves a package alone while it has any open update PR,
+even if a newer upstream release becomes available. It recognizes same-repository
+PR branches named `automation/update-<package>-<version>`; reserve that prefix
+for this workflow. Other packages can still receive proposals.
+
+When no update PR is open, the writer validates the version/hash proposal again
+and creates a fresh versioned branch from the checked default-branch commit.
+It writes only `releases/<package>.json` and opens a PR with upstream links and
+digest evidence. It never refreshes, rebases, or overwrites an existing proposal.
 Neither job builds or executes the proposed binaries, and no candidate code is
 checked out by the writer. Actions are pinned to commits.
 
-**Human approval before CI is intentional.** PRs created or updated with
+**Human approval before CI is intentional.** PRs created with
 `GITHUB_TOKEN` cause the `pull_request` checks to wait for approval. Select
 **Approve workflows to run** on the PR, inspect the offline checks and upstream
 release notes, then separately decide whether to merge. Do not replace the
@@ -123,15 +126,19 @@ python3 -m unittest discover -s tests -v
 This prints proposed metadata and verifies downloads without changing files or
 creating PRs. You can copy a reviewed selection into `releases/<package>.json`
 and run the builds above for a manual update. No-op runs still verify the
-currently selected release digest. Repeating a pending proposal creates no
-extra commit or PR; interrupted PR creation can recover on the next run.
+currently selected release digest. Repeating a pending proposal leaves its
+branch, title, body, and CI approval state untouched.
 
-If main moved during discovery, rerun. If an update branch has manual edits or
-a conflicting hash, inspect and reconcile it before rerunning; automation will
-not force-overwrite it. Close the PR and delete its update branch to start
-fresh after preserving any needed work. Closing alone does not suppress a
-release: the next run proposes it again. Disable the update workflow while
-investigating a release you do not want to adopt.
+If main moved during discovery, rerun. If publication is interrupted or the
+versioned branch already exists without an open PR, the workflow stops. Inspect
+that branch and either finish the PR manually or delete it after preserving any
+needed work, then rerun. There is no automatic recovery or branch cleanup.
+
+Merge or close the current PR before requesting another proposal for that
+package. A retained branch for an older version does not block a newer release;
+retrying the same version requires deleting its branch first. Closing a PR is
+not a durable release exclusion. Disable the update workflow while investigating
+a release you do not want to adopt.
 
 Restore the previous metadata commit to undo a package selection. Consumers
 must separately restore their prior dependency lock and deploy the previous

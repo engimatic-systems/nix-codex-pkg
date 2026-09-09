@@ -49,22 +49,15 @@ def encode_pin(pin):
     return json.dumps(validate_pin(pin), indent=2) + "\n"
 
 
-def api(endpoint, method="GET", payload=None):
+def api(endpoint, method="GET", payload=None, paginate=False):
     command = ["gh", "api", "--method", method, endpoint]
+    if paginate:
+        command += ["--paginate", "--slurp"]
     if payload is not None:
         command += ["--input", "-"]
     result = subprocess.run(command, input=json.dumps(payload) if payload is not None else None,
                             text=True, capture_output=True, check=True)
     return json.loads(result.stdout) if result.stdout.strip() else None
-
-
-def optional_api(endpoint):
-    try:
-        return api(endpoint)
-    except subprocess.CalledProcessError as error:
-        if "(HTTP 404)" in error.stderr:
-            return None
-        raise
 
 
 def release_urls(package, version):
@@ -165,53 +158,30 @@ def publish(value):
     require(repo == "engimatic-systems/nix-engimatic-pkgs", "unexpected destination repository")
     require(os.environ.get("GITHUB_EVENT_NAME") in {"schedule", "workflow_dispatch"},
             "publisher only runs from scheduled or manual workflows")
+    prefix = f"automation/update-{package}-"
+    pages = api(f"repos/{repo}/pulls?state=open&per_page=100", paginate=True)
+    if any(pull["head"]["ref"].startswith(prefix)
+           and (pull["head"].get("repo") or {}).get("full_name") == repo
+           for page in pages for pull in page):
+        print(f"{package}: existing update PR left untouched")
+        return
+
     base = api(f"repos/{repo}")["default_branch"]
     base_ref = api(f"repos/{repo}/git/ref/heads/{base}")
-    require(base_ref["object"]["sha"] == os.environ["GITHUB_SHA"],
+    base_sha = base_ref["object"]["sha"]
+    require(base_sha == os.environ["GITHUB_SHA"],
             "default branch moved since discovery; rerun the workflow")
     path = f"releases/{package}.json"
-    _, base_pin = contents(repo, path, base)
+    file_data, base_pin = contents(repo, path, base_sha)
     require(base_pin == previous, "base selection changed; rediscover the release")
 
-    branch = f"automation/update-{package}"
-    branch_ref = optional_api(f"repos/{repo}/git/ref/heads/{branch}")
-    if branch_ref is None:
-        branch_ref = api(f"repos/{repo}/git/refs", "POST",
-                         {"ref": f"refs/heads/{branch}", "sha": base_ref["object"]["sha"]})
-    else:
-        # Inspect the diff without checking out/executing anything from the PR branch.
-        comparison = api(f"repos/{repo}/compare/{base}...{branch}")
-        require(comparison.get("status") in {"ahead", "diverged", "identical", "behind"},
-                "cannot compare update branch")
-        require(all(item["filename"] == path and item["status"] == "modified"
-                    for item in comparison.get("files", [])),
-                "update branch has non-metadata edits; review it manually")
-
-    _, branch_pin = contents(repo, path, branch)
-    require(version_tuple(branch_pin["version"]) <= version_tuple(selected["version"]),
-            "update branch already has a newer version")
-    if branch_pin["version"] == selected["version"]:
-        require(branch_pin == selected, "update branch has conflicting release hash")
-    else:
-        # Construct exactly main + this metadata file. Preserve branch ancestry
-        # so a non-forced ref update rejects concurrent edits and survives squash
-        # merges or retained update branches without carrying stale recipes.
-        base_sha = base_ref["object"]["sha"]
-        branch_sha = branch_ref["object"]["sha"]
-        base_commit = api(f"repos/{repo}/git/commits/{base_sha}")
-        tree = api(f"repos/{repo}/git/trees", "POST", {
-            "base_tree": base_commit["tree"]["sha"],
-            "tree": [{"path": path, "mode": "100644", "type": "blob", "content": encode_pin(selected)}],
-        })
-        commit = api(f"repos/{repo}/git/commits", "POST", {
-            "message": f"Update {package} to {selected['version']}", "tree": tree["sha"],
-            "parents": list(dict.fromkeys([branch_sha, base_sha])),
-        })
-        api(f"repos/{repo}/git/refs/heads/{branch}", "PATCH", {"sha": commit["sha"], "force": False})
-
-    owner = repo.split("/")[0]
-    pulls = api(f"repos/{repo}/pulls?state=open&head={owner}:{branch}&base={base}")
-    require(len(pulls) <= 1, "multiple update PRs found")
+    branch = prefix + selected["version"]
+    # Creation fails if this branch exists. Never reuse or overwrite a proposal.
+    api(f"repos/{repo}/git/refs", "POST", {"ref": f"refs/heads/{branch}", "sha": base_sha})
+    api(f"repos/{repo}/contents/{path}", "PUT", {
+        "message": f"Update {package} to {selected['version']}", "branch": branch,
+        "sha": file_data["sha"], "content": base64.b64encode(encode_pin(selected).encode()).decode(),
+    })
     release_url, asset_url = release_urls(package, selected["version"])
     body = (f"Update {package} from {previous['version']} to {selected['version']}.\n\n"
             f"[Upstream release notes]({release_url}) · [Official archive]({asset_url})\n\n"
@@ -221,15 +191,10 @@ def publish(value):
             "Approve the PR workflows to run the offline package checks, then review "
             "the release before merging. Digest verification establishes byte identity, "
             "not upstream safety. A merge does not deploy any host.\n")
-    fields = {"title": f"Update {package} to {selected['version']}", "body": body}
-    if pulls:
-        pull = pulls[0]
-        if pull["title"] != fields["title"] or pull["body"] != body:
-            api(f"repos/{repo}/pulls/{pull['number']}", "PATCH", fields)
-        print(pull["html_url"])
-    else:
-        pull = api(f"repos/{repo}/pulls", "POST", {**fields, "head": branch, "base": base})
-        print(pull["html_url"])
+    pull = api(f"repos/{repo}/pulls", "POST", {
+        "title": f"Update {package} to {selected['version']}", "body": body, "head": branch, "base": base,
+    })
+    print(pull["html_url"])
 
 
 def main():

@@ -1,8 +1,8 @@
 import base64
-from copy import deepcopy
 import importlib.util
 import json
 import os
+import subprocess
 from pathlib import Path
 import unittest
 from unittest.mock import patch
@@ -87,111 +87,89 @@ class DiscoveryTests(unittest.TestCase):
                 updates.validate_candidate(value)
 
 
-class FakeGitHub:
-    """Model remote branch/file/PR state and record all write operations."""
-
-    def __init__(self):
-        self.branch = None
-        self.pull = None
-        self.files = []
-        self.base_sha = "trusted"
-        self.writes = []
-
-    def api(self, endpoint, method="GET", payload=None):
-        prefix = "repos/engimatic-systems/nix-engimatic-pkgs"
-        path = endpoint.removeprefix(prefix)
-        if method != "GET":
-            self.writes.append((path, method, payload))
-        if path == "":
-            return {"default_branch": "main"}
-        if path == "/git/ref/heads/main":
-            return {"object": {"sha": self.base_sha}}
-        if path == "/git/ref/heads/automation/update-pi":
-            return {"object": {"sha": "branch"}} if self.branch else None
-        if path == "/git/refs":
-            self.branch = deepcopy(OLD)
-            return {"object": {"sha": self.base_sha}}
-        if path == "/git/commits/trusted":
-            return {"tree": {"sha": "trusted-tree"}}
-        if path == "/git/trees":
-            assert payload["base_tree"] == "trusted-tree"
-            assert len(payload["tree"]) == 1
-            entry = payload["tree"][0]
-            assert (entry["path"], entry["mode"], entry["type"]) == ("releases/pi.json", "100644", "blob")
-            self.pending = json.loads(entry["content"])
-            return {"sha": "new-tree"}
-        if path == "/git/commits":
-            assert payload["tree"] == "new-tree"
-            assert "trusted" in payload["parents"]
-            return {"sha": "new-commit"}
-        if path == "/git/refs/heads/automation/update-pi":
-            assert payload == {"sha": "new-commit", "force": False}
-            self.branch = self.pending
-            self.files = [{"filename": "releases/pi.json", "status": "modified"}]
-            return {}
-        if path.startswith("/compare/"):
-            return {"status": "ahead", "files": self.files}
-        if path.startswith("/contents/releases/pi.json"):
-            pin = OLD if path.endswith("ref=main") else self.branch
-            return {"type": "file", "encoding": "base64", "sha": "file-sha",
-                    "content": base64.b64encode(json.dumps(pin).encode()).decode()}
-        if path.startswith("/pulls?"):
-            return [self.pull] if self.pull else []
-        if path == "/pulls" or path == "/pulls/1":
-            self.pull = {**payload, "number": 1, "html_url": "https://github.com/example/pr/1"}
-            return self.pull
-        raise AssertionError((endpoint, method, payload))
-
-
 class PublisherTests(unittest.TestCase):
     def setUp(self):
-        self.github = FakeGitHub()
-        for mock in (
-            patch.dict(os.environ, {"GITHUB_REPOSITORY": "engimatic-systems/nix-engimatic-pkgs",
+        self.repo = "engimatic-systems/nix-engimatic-pkgs"
+        self.pulls = [[]]
+        self.base_sha = "trusted"
+        self.colliding_branch = False
+        self.responses = {
+            "": {"default_branch": "main"},
+            "/contents/releases/pi.json?ref=trusted": {
+                "type": "file", "encoding": "base64", "sha": "file-sha",
+                "content": base64.b64encode(json.dumps(OLD).encode()).decode(),
+            },
+        }
+        mocks = [
+            patch.dict(os.environ, {"GITHUB_REPOSITORY": self.repo,
                        "GITHUB_EVENT_NAME": "schedule", "GITHUB_SHA": "trusted"}),
-            patch.object(updates, "api", self.github.api),
-            patch.object(updates, "optional_api", self.github.api),
-        ):
-            mock.start()
+            patch.object(updates, "api", side_effect=self.respond),
+        ]
+        for mock in mocks:
+            self.api = mock.start()
             self.addCleanup(mock.stop)
 
-    def test_create_then_repeat_is_noop_and_interrupted_pr_creation_recovers(self):
-        updates.publish(PROPOSAL)
-        self.assertEqual(self.github.branch, NEW)
-        self.assertEqual([method for _, method, _ in self.github.writes],
-                         ["POST", "POST", "POST", "PATCH", "POST"])
-        self.github.writes.clear()
-        updates.publish(PROPOSAL)
-        self.assertEqual(self.github.writes, [])
-        self.github.pull = None
-        updates.publish(PROPOSAL)
-        self.assertEqual([(path, method) for path, method, _ in self.github.writes],
-                         [("/pulls", "POST")])
+    def respond(self, endpoint, method="GET", payload=None, paginate=False):
+        path = endpoint.removeprefix(f"repos/{self.repo}")
+        if path.startswith("/pulls?"):
+            self.assertTrue(paginate)
+            return self.pulls
+        if path == "/git/ref/heads/main":
+            return {"object": {"sha": self.base_sha}}
+        if method != "GET":
+            if self.colliding_branch and path == "/git/refs":
+                raise subprocess.CalledProcessError(1, ["gh", "api"], stderr="Reference already exists")
+            return {"html_url": "https://github.com/example/pr/1"}
+        return self.responses[path]
 
-    def test_existing_pr_advances_without_a_second_pr(self):
-        updates.publish(PROPOSAL)
-        self.github.writes.clear()
-        updates.publish({**PROPOSAL, "selected": {**NEW, "version": "1.2.0"}})
-        self.assertEqual([(path, method) for path, method, _ in self.github.writes],
-                         [("/git/trees", "POST"), ("/git/commits", "POST"),
-                          ("/git/refs/heads/automation/update-pi", "PATCH"), ("/pulls/1", "PATCH")])
+    def writes(self):
+        return [call.args for call in self.api.call_args_list
+                if len(call.args) > 1 and call.args[1] != "GET"]
 
-    def test_non_metadata_edits_are_not_overwritten(self):
-        self.github.branch = OLD
-        self.github.files = [{"filename": ".github/workflows/check.yml", "status": "modified"}]
-        with self.assertRaisesRegex(ValueError, "non-metadata"):
+    def test_new_proposal_changes_only_metadata_on_a_new_versioned_branch(self):
+        updates.publish(PROPOSAL)
+        writes = self.writes()
+        self.assertEqual([(url.removeprefix(f"repos/{self.repo}"), method)
+                          for url, method, _ in writes],
+                         [("/git/refs", "POST"), ("/contents/releases/pi.json", "PUT"), ("/pulls", "POST")])
+        self.assertEqual(writes[0][2], {"ref": "refs/heads/automation/update-pi-1.1.0", "sha": "trusted"})
+        self.assertEqual(json.loads(base64.b64decode(writes[1][2]["content"])), NEW)
+        self.assertEqual(writes[1][2]["branch"], "automation/update-pi-1.1.0")
+        self.assertEqual(writes[1][2]["sha"], "file-sha")
+        self.assertEqual(writes[2][2]["base"], "main")
+        self.assertEqual(writes[2][2]["head"], "automation/update-pi-1.1.0")
+
+    def test_open_older_update_pr_is_untouched_even_on_a_later_page(self):
+        self.pulls = [[], [{"head": {"ref": "automation/update-pi-1.0.1",
+                                   "repo": {"full_name": self.repo}}}]]
+        updates.publish(PROPOSAL)
+        self.assertEqual(self.writes(), [])
+        self.assertEqual(self.api.call_count, 1)
+
+    def test_other_package_and_fork_prs_do_not_block_new_proposals(self):
+        self.pulls = [[
+            {"head": {"ref": "automation/update-codex-1.1.0", "repo": {"full_name": self.repo}}},
+            {"head": {"ref": "automation/update-pi-1.1.0", "repo": {"full_name": "someone/fork"}}},
+        ]]
+        updates.publish(PROPOSAL)
+        self.assertEqual(len(self.writes()), 3)
+
+    def test_colliding_branch_stops_without_overwriting_or_recovering(self):
+        self.colliding_branch = True
+        with self.assertRaises(subprocess.CalledProcessError):
             updates.publish(PROPOSAL)
-        self.assertEqual(self.github.writes, [])
+        self.assertEqual(len(self.writes()), 1)
+        self.assertTrue(self.writes()[0][0].endswith("/git/refs"))
 
     def test_moved_base_and_untrusted_trigger_cannot_write(self):
-        self.github.base_sha = "new-main"
+        self.base_sha = "new-main"
         with self.assertRaisesRegex(ValueError, "moved"):
             updates.publish(PROPOSAL)
-        self.assertEqual(self.github.writes, [])
+        self.assertEqual(self.writes(), [])
         with patch.dict(os.environ, {"GITHUB_EVENT_NAME": "pull_request"}):
             with self.assertRaisesRegex(ValueError, "scheduled or manual"):
                 updates.publish(PROPOSAL)
-        self.assertEqual(self.github.writes, [])
+        self.assertEqual(self.writes(), [])
 
 
 if __name__ == "__main__":

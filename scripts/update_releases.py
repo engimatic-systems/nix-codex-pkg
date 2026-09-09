@@ -23,17 +23,30 @@ VERSION = re.compile(r"(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)", re.AS
 
 
 def require(condition, message):
+    """Return None if condition is truthy; otherwise raise ValueError(message)."""
     if not condition:
         raise ValueError(message)
 
 
 def version_tuple(version):
+    """Validate a stable version string and return its three integer components.
+
+    Accept only major.minor.patch, with no leading zeroes, suffixes, or build
+    metadata, and fewer than 40 characters. Raise ValueError on other inputs.
+    The returned tuple supports numeric version comparison; no I/O is performed.
+    """
     require(isinstance(version, str) and len(version) < 40 and VERSION.fullmatch(version),
             "expected a stable major.minor.patch version")
     return tuple(map(int, version.split(".")))
 
 
 def validate_pin(pin):
+    """Return the same pin dict after validating its version and hash syntax.
+
+    Require exactly {"version", "hash"}, a stable version, and a canonical
+    SHA-256 SRI string encoding 32 bytes. Raise ValueError on invalid pins.
+    Do not copy/mutate the dict, fetch an archive, or verify its actual bytes.
+    """
     require(isinstance(pin, dict) and set(pin) == {"version", "hash"},
             "release pin must contain only version and hash")
     version_tuple(pin["version"])
@@ -46,10 +59,24 @@ def validate_pin(pin):
 
 
 def encode_pin(pin):
+    """Validate a pin and return two-space-indented JSON with a trailing newline.
+
+    Preserve the dict's field order. Validation errors propagate; this only
+    produces text and does not write a file or change the input.
+    """
     return json.dumps(validate_pin(pin), indent=2) + "\n"
 
 
 def api(endpoint, method="GET", payload=None, paginate=False):
+    """Call gh api and return decoded JSON, or None for an empty response.
+
+    endpoint is a GitHub API path; payload, when supplied, is JSON sent on
+    stdin. paginate=True returns a list of page responses without flattening
+    them. Authentication comes from gh's inherited environment/configuration.
+    Callers own endpoint, method, and permission choices: this helper can
+    mutate remote state. Process failures and JSON/serialization errors
+    propagate; there is no application-level retry or recovery here.
+    """
     command = ["gh", "api", "--method", method, endpoint]
     if paginate:
         command += ["--paginate", "--slurp"]
@@ -61,6 +88,12 @@ def api(endpoint, method="GET", payload=None, paginate=False):
 
 
 def release_urls(package, version):
+    """Return (release_page_url, archive_url) for a configured package/version.
+
+    package must be a PACKAGES key; callers must already have validated
+    version. This formats the fixed upstream repository/tag/asset convention
+    without network access or checking whether the release exists.
+    """
     repo, prefix, asset = PACKAGES[package]
     tag = prefix + version
     return (f"https://github.com/{repo}/releases/tag/{tag}",
@@ -68,6 +101,14 @@ def release_urls(package, version):
 
 
 def select_asset(package, release):
+    """Validate GitHub release metadata and return (version, URL, SHA-256 hex).
+
+    Expect a configured package and a decoded GitHub release object. Require
+    an explicitly non-draft, non-prerelease stable tag, the exact release URL,
+    and exactly one expected platform archive with its exact URL and digest.
+    Invalid release fields raise ValueError; malformed API structures may
+    also raise key/type errors. This inspects metadata only, not asset bytes.
+    """
     repo, prefix, name = PACKAGES[package]
     require(release.get("draft") is False and release.get("prerelease") is False,
             "refusing draft or prerelease")
@@ -88,12 +129,27 @@ def select_asset(package, release):
 
 
 class HTTPSRedirects(urllib.request.HTTPRedirectHandler):
+    """Allow urllib's normal redirect handling only for HTTPS destinations."""
+
     def redirect_request(self, request, fp, code, msg, headers, newurl):
+        """Delegate urllib's redirect callback after checking newurl's scheme.
+
+        Raise ValueError for non-HTTPS destinations; otherwise return the
+        superclass result. Hostnames are not restricted, allowing GitHub's CDN.
+        """
         require(urllib.parse.urlparse(newurl).scheme == "https", "non-HTTPS asset redirect")
         return super().redirect_request(request, fp, code, msg, headers, newurl)
 
 
 def download_digest(url):
+    """Stream an expected archive URL and return its lowercase SHA-256 hex digest.
+
+    Callers supply the official HTTPS URL validated by select_asset. Redirects
+    must stay HTTPS. Send no authentication token and never save, extract, or
+    execute the archive. Reject empty responses and downloads over 1 GiB with
+    ValueError. Network errors propagate. The 60-second socket timeout is not
+    a deadline for the complete download; the workflow also limits job time.
+    """
     # No token is sent to release assets or their CDN redirects. Never extract/run them.
     digest = hashlib.sha256()
     size = 0
@@ -108,6 +164,18 @@ def download_digest(url):
 
 
 def candidate(package, current, release, fetch_digest=download_digest):
+    """Return a verified upgrade proposal, or None for the unchanged selection.
+
+    Validate current and the release metadata before fetching the archive.
+    fetch_digest(URL) must return its SHA-256 hex digest; the default performs
+    network I/O. Even an unchanged version is fetched and hash-checked.
+    Reject downgrades, upstream/download digest disagreement, and changed
+    bytes for the currently selected version. Validation/fetch errors propagate.
+
+    The result is {"package", "previous", "selected"}; previous references
+    current, and selected is a new version/hash dict. Inputs are not modified.
+    Digest agreement establishes byte identity, not release safety.
+    """
     validate_pin(current)
     version, url, expected = select_asset(package, release)
     require(version_tuple(version) >= version_tuple(current["version"]), "refusing downgrade")
@@ -122,6 +190,13 @@ def candidate(package, current, release, fetch_digest=download_digest):
 
 
 def validate_candidate(value):
+    """Return the same proposal after checking its shape and version progression.
+
+    Require exactly {"package", "previous", "selected"}, a configured package,
+    valid pins, and selected.version strictly newer than previous.version.
+    Raise on invalid input without changing it or performing I/O. This does
+    not repeat discovery's download/digest verification or check remote state.
+    """
     require(isinstance(value, dict) and set(value) == {"package", "previous", "selected"},
             "unexpected proposal fields")
     require(value["package"] in PACKAGES, "unknown package")
@@ -133,6 +208,14 @@ def validate_candidate(value):
 
 
 def inspect(packages):
+    """Read local pins and return verified upgrade proposals in package order.
+
+    packages is an iterable of PACKAGES keys. Read releases/<package>.json,
+    query each upstream's latest release through gh, and verify its archive
+    through candidate(). Log each result to stderr and omit unchanged pins.
+    File, API, parsing, and verification errors stop the call; no partial list
+    is returned. Do not write pins, branches, or PRs, or check for open PRs.
+    """
     proposals = []
     for package in packages:
         current = json.loads((ROOT / "releases" / f"{package}.json").read_text())
@@ -146,12 +229,34 @@ def inspect(packages):
 
 
 def contents(repo, path, ref):
+    """Fetch release metadata at ref and return (GitHub file response, valid pin).
+
+    repo and path are caller-selected API path components; ref is a branch,
+    tag, or commit and is URL-escaped. Require an API-reported base64 file,
+    decode its JSON, and validate the pin. Preserve the response's blob SHA
+    for the later conditional file update. API/decoding/validation errors
+    propagate. This helper only reads remote state.
+    """
     data = api(f"repos/{repo}/contents/{path}?ref={urllib.parse.quote(ref, safe='')}")
     require(data.get("type") == "file" and data.get("encoding") == "base64", "expected regular metadata file")
     return data, validate_pin(json.loads(base64.b64decode(data["content"])))
 
 
 def publish(value):
+    """Create one metadata-only update PR, or leave an open package PR untouched.
+
+    value must be a discovery-produced proposal; only its structure is
+    revalidated here. Require GITHUB_REPOSITORY, GITHUB_EVENT_NAME, GITHUB_SHA,
+    and gh authentication with contents/PR write access. Environment checks
+    guard expected invocation context; they do not authenticate the caller.
+
+    Print a skip message for an existing same-repository update PR. Otherwise
+    check the base against discovery, create a fresh versioned branch, commit
+    its pin, and open a PR; print its URL and return None. Validation/API errors
+    propagate. The workflow must serialize publishers. Writes are separate
+    operations: failures can leave a branch/commit requiring manual cleanup.
+    Never refresh an existing proposal, execute assets, approve CI, or merge.
+    """
     # 1. Validate the proposal and expected repository/workflow context.
     value = validate_candidate(value)
     package, previous, selected = value["package"], value["previous"], value["selected"]
@@ -207,6 +312,18 @@ def publish(value):
 
 
 def main():
+    """Dispatch the CLI from sys.argv; return None on successful execution.
+
+    check prints a JSON proposal list to stdout. With --github-output, also
+    append proposals=<JSON> to the step-output file named by GitHub's built-in
+    GITHUB_OUTPUT. Without that flag, check needs no Actions-specific variables.
+
+    publish parses the custom PROPOSAL environment variable supplied by our
+    workflow's matrix job and passes it to publish(), with that function's
+    environment and write requirements. Missing variables, invalid JSON, and
+    helper failures propagate to the entry-point error handler. argparse
+    handles help/usage exits; this function neither retries nor rolls back.
+    """
     parser = argparse.ArgumentParser(description=__doc__)
     commands = parser.add_subparsers(dest="command", required=True)
     check = commands.add_parser("check", help="download/hash official assets and print proposals; no writes")

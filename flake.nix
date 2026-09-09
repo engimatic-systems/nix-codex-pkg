@@ -18,6 +18,15 @@
       };
 
       # Building the package runs its offline installation checks.
-      checks.${system} = { inherit codex pi; };
+      checks.${system} = {
+        inherit codex pi;
+        updater = pkgs.runCommand "release-updater-checks" { nativeBuildInputs = [ pkgs.python3 ]; } ''
+          export PYTHONDONTWRITEBYTECODE=1
+          cp -r ${./scripts} scripts
+          cp -r ${./tests} tests
+          python -m unittest discover -s tests -v
+          touch "$out"
+        '';
+      };
     };
 }

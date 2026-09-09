@@ -80,10 +80,58 @@ deployment for older npm installs or shims taking precedence.
 
 ## Update and recover
 
-For now, update the selected version and hash in `releases/<package>.json`,
-verify the downloaded archive against the official release asset digest, and
-run the builds/checks above. A hash establishes byte identity, not upstream
-safety. Review release notes before adopting a new selection.
+The **Propose release updates** workflow runs daily at 09:23 UTC or manually
+from the Actions page on the default branch. GitHub schedules are best-effort;
+a manual run provides the same behavior. It uses the repository's built-in
+`GITHUB_TOKEN`; no separate bot account, personal token, or GitHub App is needed.
+
+Keep organization/repository token defaults read-only and enable **Allow GitHub
+Actions to create and approve pull requests**. Only the PR-writing job requests
+`contents: write` and `pull-requests: write`. It never approves or merges PRs.
+
+The read-only discovery job queries each official repository's latest stable
+release, checks the expected tag and archive URL, downloads the archive without
+extracting or running it, and compares its SHA-256 against GitHub's release asset
+digest. Missing digests/assets, prereleases, downgrades, digest mismatches, and
+changed bytes for the currently selected release fail for manual investigation.
+
+The separate writer validates the small version/hash proposal again and writes
+only `releases/<package>.json` on `automation/update-<package>`. It opens or
+refreshes one PR per package with upstream links and digest evidence. It
+preserves branch ancestry and constructs the candidate from current main plus
+that one metadata file, including when an earlier update was squash-merged.
+Non-metadata edits on an update branch stop automation for manual review.
+Neither job builds or executes the proposed binaries, and no candidate code is
+checked out by the writer. Actions are pinned to commits.
+
+**Human approval before CI is intentional.** PRs created or updated with
+`GITHUB_TOKEN` cause the `pull_request` checks to wait for approval. Select
+**Approve workflows to run** on the PR, inspect the offline checks and upstream
+release notes, then separately decide whether to merge. Do not replace the
+token or add workflow dispatch to bypass this gate. See
+[GitHub's workflow-trigger contract](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow#triggering-a-workflow-from-a-workflow).
+A matching hash establishes byte identity, not upstream safety.
+
+For a read-only local check (Python 3.10+ and authenticated `gh`):
+
+```sh
+python3 scripts/update_releases.py check all
+python3 scripts/update_releases.py check pi
+python3 -m unittest discover -s tests -v
+```
+
+This prints proposed metadata and verifies downloads without changing files or
+creating PRs. You can copy a reviewed selection into `releases/<package>.json`
+and run the builds above for a manual update. No-op runs still verify the
+currently selected release digest. Repeating a pending proposal creates no
+extra commit or PR; interrupted PR creation can recover on the next run.
+
+If main moved during discovery, rerun. If an update branch has manual edits or
+a conflicting hash, inspect and reconcile it before rerunning; automation will
+not force-overwrite it. Close the PR and delete its update branch to start
+fresh after preserving any needed work. Closing alone does not suppress a
+release: the next run proposes it again. Disable the update workflow while
+investigating a release you do not want to adopt.
 
 Restore the previous metadata commit to undo a package selection. Consumers
 must separately restore their prior dependency lock and deploy the previous
